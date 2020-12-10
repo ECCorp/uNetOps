@@ -13,26 +13,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
-#include <uNetOps.h>
+#include <uNetDev/uNetDev.hh>
 
 #define __lbpf__pe(class, lbpf_e, user_str)        do { libbpf_strerror(lbpf_e, __lbpferr__, sizeof(__lbpferr__)); \
                                     fprintf(stderr, "%s::%s: %s @ %d => %s\n", #class, __func__, __lbpferr__, __LINE__, user_str); } while (0)
-
-struct us_xdp_load {
-    ___api___
-    us_xdp_load(){};
-    int link(const char *file, const char *link, int xdp_mode);
-    int unlink(const char *dev, int xdp_mode);
-    int getelem(const char *mapname, void * key, void * value);
-    int setelem(const char *mapname, void * key, void * value);
-
-    char libbpf_estr[256];
-#define __lbpferr__ libbpf_estr
-    int progdesc;
-    /* This needs to be at the end; otherwise, libbpf will write over our instance variables */
-    struct bpf_object * obj;
-};
-
 
 int us_xdp_load::link(const char *file, const char *dev, int xdp_mode) {
     int bpf_error;
@@ -93,13 +77,11 @@ int us_xdp_load::setelem(const char *mapname, void *key, void *value) {
     int map_fd, lbpf_err;
 
     if (0 > (map_fd = bpf_object__find_map_fd_by_name(obj, mapname))) {
-        puts("here");
         __lbpf__pe(us_xdp_load, map_fd, "returning bpf errorcode");
         return map_fd;
     }
 
     if (0 > (lbpf_err = bpf_map_update_elem(map_fd, key, value, BPF_ANY))) {
-        puts("here");
         __lbpf__pe(us_xdp_load, lbpf_err, "returning bpf errorcode");
         return lbpf_err;
     }

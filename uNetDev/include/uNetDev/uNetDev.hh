@@ -1,11 +1,7 @@
-#ifndef ___UNETOPS_H___
-#define ___UNETOPS_H___
+#ifndef ___UNETDEV_HH___
+#define ___UNETDEV_HH___
 
-#define component   struct
-#define preproc     template
-#define ___api___   public:
-#define ___lib___   protected:
-#define ___abi___   private:
+#define pp     template
 
 #include <linux/types.h>
 #include <bpf/bpf.h>
@@ -29,6 +25,7 @@ typedef __u64   u64;
 typedef __u32   u32;
 typedef __u8    u8;
 
+ __attribute__((weak))
 int processor(int cpu_nr) {
     cpu_set_t cpu;
     pid_t pid = getpid();
@@ -47,9 +44,15 @@ int processor(int cpu_nr) {
 struct us_ring {
     u32 l_prod, l_cons;
     u32 mask, size;
-    u32 *sh_prod, *sh_cons;
-    void *ring;
-    u32 *flags;
+    __volatile__ u32 *sh_prod, *sh_cons;
+    __volatile__ void *ring;
+    __volatile__ u32 *flags;
+};
+
+struct ring_d {
+    u64 addr;
+    u32 len;
+    u32 opts;
 };
 
 enum umem_ring_t {
@@ -57,5 +60,5 @@ enum umem_ring_t {
 };
 
 #define ptull(x)    ((u64)(uintptr_t)x)
-
+#include "us_xdp_load.hh"
 #endif

@@ -1,8 +1,6 @@
 #ifndef ___US_XDP_LOAD_HH___
 #define ___US_XDP_LOAD_HH___
-#include <uNetOps.h>
 struct us_xdp_load {
-    ___api___
     us_xdp_load(){};
     int link(const char *file, const char *link, int xdp_mode);
     int unlink(const char *dev, int xdp_mode);

@@ -1,36 +1,53 @@
 #include <net/if.h>
 #include <bpf/xsk.h>
 #include <sys/mman.h>
-
+#include <x86intrin.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <assert.h>
+#include <EC/uSMP.h>
+#include <uNetDev/uNetDev.hh>
+#include <poll.h>
+#include <sys/resource.h>
 
-#include <uNetOps.h>
-#include <us_xdp_load.hh>
-
-/* Each us_xdp_ring will inject a us_xdp_umem instance as it's base class */
-preproc <int bS, int bC, int pS = 4096>
-component us_xdp_umem {
-    ___api___
-    int sk_d;
+/* one us_xdp_umem is shared for each cpu */
+pp <int bS, int bC, int pS = 4096>
+struct us_xdp_umem {
+    int sk_d, xsks;
+    struct sockaddr_xdp     sxdp;
+    __volatile__ u8 *block;
+    struct us_ring f_ring, c_ring, r_ring, t_ring;
 
     us_xdp_umem(){};
     int channel(const char *netdev, int cpu_nr, int xdp_mode);
     int registr(unsigned int umem_flags);
     int rings();
-
-    int getaddr(umem_ring_t ring, int idx);
-    ___lib___
-    struct sockaddr_xdp     sxdp;
-
-    ___abi___
-    struct us_ring f_ring, c_ring, r_ring, t_ring;
-
-    u8 block[bC][bS] __attribute__((aligned(pS)));
+    int fill(u64 umem_adr);
+    struct ring_d &rx();
+    void comp();
+    int tx();
 };
 
-preproc <int bS, int bC, int pS>
+const static inline u32 ldiff_prcr(struct us_ring *r) {
+    return r->l_prod - r->l_cons;
+}
+
+const static inline u32 ldiff_crpr(struct us_ring *r) {
+    return r->l_cons - r->l_prod;
+}
+
+const static inline int fr_count(struct us_ring *r) {
+    u32 nfr_blocks;
+
+    if (0 == (nfr_blocks = ldiff_prcr(r))) {
+        r->l_prod = *r->sh_prod;
+        return ldiff_prcr(r);
+    }
+
+    return nfr_blocks;
+}
+
+pp <int bS, int bC, int pS>
 int us_xdp_umem<bS, bC, pS>::channel(const char *netdev, int cpu_nr, int xdp_mode) {
     sxdp.sxdp_family = AF_XDP;
     sxdp.sxdp_flags = xdp_mode;
@@ -46,10 +63,12 @@ int us_xdp_umem<bS, bC, pS>::channel(const char *netdev, int cpu_nr, int xdp_mod
     return processor(cpu_nr);
 }
 
-preproc <int bS, int bC, int pS>
+pp <int bS, int bC, int pS>
 int us_xdp_umem<bS, bC, pS>::registr(unsigned int umem_flags) {
     struct xdp_umem_reg umr;
     int rv, blk_count = bC;
+    
+    block = (volatile u8*)aligned_alloc(pS, bS * bC);
 
     umr.addr = (u64)(uintptr_t)block;
     umr.chunk_size = bS;
@@ -93,7 +112,7 @@ int us_xdp_umem<bS, bC, pS>::registr(unsigned int umem_flags) {
     return 0;
 }
 
-preproc <int bS, int bC, int pS>
+pp <int bS, int bC, int pS>
 int us_xdp_umem<bS, bC, pS>::rings() {
     int e;
     void *mm;
@@ -152,12 +171,12 @@ int us_xdp_umem<bS, bC, pS>::rings() {
                         return (int)(uintptr_t)mm;
                     }
 
-    r_ring.ring     = (void *)(xmo.rx.desc + (u8*)mm);
-    r_ring.sh_cons  = (u32 *)(xmo.rx.consumer + (u8*)mm);
-    r_ring.sh_prod  = (u32 *)(xmo.rx.producer + (u8*)mm);
+    r_ring.ring     = (void *)(xmo.rx.desc + ((u8*)mm));
+    r_ring.sh_cons  = (u32 *)(xmo.rx.consumer + ((u8*)mm));
+    r_ring.sh_prod  = (u32 *)(xmo.rx.producer + ((u8*)mm));
     r_ring.size     = xmo.rx.desc + (bC * sizeof(struct xdp_desc));
     r_ring.mask     = bC - 1;
-    r_ring.flags    = (u32*)(xmo.rx.flags + (u8*)mm);
+    r_ring.flags    = (u32*)(xmo.rx.flags + ((u8*)mm));
     r_ring.l_cons   = *(r_ring.sh_cons);
     r_ring.l_prod   = *(r_ring.sh_prod);
 
@@ -170,57 +189,53 @@ int us_xdp_umem<bS, bC, pS>::rings() {
                         return (int)(uintptr_t)mm;
                     }
 
-    t_ring.ring     = (void *)(xmo.tx.desc + (u8*)mm);
-    t_ring.sh_cons  = (u32 *)(xmo.tx.consumer + (u8*)mm);
-    t_ring.sh_prod  = (u32 *)(xmo.tx.producer + (u8*)mm);
+    t_ring.ring     = (void *)(xmo.tx.desc + ((u8*)mm));
+    t_ring.sh_cons  = (u32 *)(xmo.tx.consumer + ((u8*)mm));
+    t_ring.sh_prod  = (u32 *)(xmo.tx.producer + ((u8*)mm));
     t_ring.size     = xmo.tx.desc + (bC * sizeof(struct xdp_desc));
     t_ring.mask     = bC - 1;
     t_ring.flags    = (u32*)(xmo.tx.flags + (u8*)mm);
     t_ring.l_cons   = *(t_ring.sh_cons);
     t_ring.l_prod   = *(t_ring.sh_prod);
 
-    assert(pS == (ptull(f_ring.ring) - ptull(c_ring.ring)));
-    assert(pS == (ptull(c_ring.ring) - ptull(r_ring.ring)));
-    assert(pS == (ptull(r_ring.ring) - ptull(t_ring.ring)));
+    //assert(pS == (ptull(f_ring.ring) - ptull(c_ring.ring)));
+    //assert(pS == (ptull(c_ring.ring) - ptull(r_ring.ring)));
+    //assert(pS == (ptull(r_ring.ring) - ptull(t_ring.ring)));
 
-    return bind(sk_d, (const sockaddr *)&sxdp, sizeof(sxdp));
-}
+    if (0 > (e = bind(sk_d, (const sockaddr *)&sxdp, 
+                            sizeof(sxdp)))) {
+                                perror("bind");
+                                return e;
+                            }
+    xsks = 1;
 
-preproc <int bS, int bC, int pS>
-int us_xdp_umem<bS, bC, pS>::getaddr(umem_ring_t r, int i) {
-    switch (r) {
-        case FR:
-            goto ____fr__;
-        break;
-        case CR:
-            goto ____cr__;
-        break;
-        case RR:
-        break;
-        case TR:
-        break;
-        default:
-            return -EINVAL;
-    }
-    ____fr__:
-    puts("f ring");
-    printf("cons %p: %x\n", f_ring.sh_cons, *f_ring.sh_cons);
-    printf("prod %p: %x\n", f_ring.sh_prod, *f_ring.sh_prod);
-    printf("ring %p: %llx\n", f_ring.ring, *(u64*)f_ring.ring);
-    return 0;
-
-    ____cr__:
-    puts("c ring");
-    printf("cons %p: %x\n", c_ring.sh_cons, *c_ring.sh_cons);
-    printf("prod %p: %x\n", c_ring.sh_prod, *c_ring.sh_prod);
-    printf("ring %p: %llx\n", c_ring.ring, *(u64*)c_ring.ring);
     return 0;
 }
 
+pp <int bS, int bC, int pS>
+int us_xdp_umem<bS, bC, pS>::fill(u64 umem_adr){
+    u32 nfr_blocks;
+
+    nfr_blocks = fr_count(&f_ring);
+    ((u64*)f_ring.ring)[f_ring.l_prod++ & (f_ring.mask - 1)] = umem_adr;
+
+    asm("":::"memory");
+    (*f_ring.sh_prod)++;
+
+    return 1 + nfr_blocks;
+}
+
+#define TEST
 #ifdef TEST
 int main (int argc, char *argv[]) {
     struct us_xdp_umem<2048, 2> umem;
     struct us_xdp_load uxl;
+    struct rlimit rl = {(rlim_t)-1, (rlim_t)-1};
+
+    if (0 > setrlimit(RLIMIT_MEMLOCK, &rl)) {
+        perror("setrlimit -- RLIMIT_MEMLOCK");
+        exit(1);
+    }
 
     char *netdev    = argv[1];
     char *xskprog   = argv[2];
@@ -243,9 +258,31 @@ int main (int argc, char *argv[]) {
         exit(1);
     }
 
-    umem.getaddr(FR, 0);
-    umem.getaddr(CR, 0);
+    umem.xsks = 1;
+    uxl.setelem("xsks_map", &umem.xsks, &umem.sk_d);
+    u32 gv = 0, olv = 0;
+    umem.fill(umem.block);
+puts("a");
+    struct pollfd pfd;
+    pfd.fd = umem.sk_d;
+    pfd.events = POLLIN;
+    poll(&pfd, 1, 1);
+int x = 0;
+    u32 prev_cons = *umem.f_ring.sh_cons;
+
+    while (prev_cons == *umem.f_ring.sh_cons) {
+if (x++ == 0)
+puts("b"); 
+        uxl.getelem("xsk_cpus", &cpu, &gv);
+        if (gv != olv) {
+            printf("fr %p c %d p %d r p %d\n", umem.f_ring.sh_prod, *umem.f_ring.sh_cons, *umem.f_ring.sh_prod, *umem.r_ring.sh_prod);
+            olv = gv;
+        }
+    }
+    printf("PACKET IN RING --> producer %u => %u\n", prev_cons, *umem.f_ring.sh_cons);
 
     uxl.unlink(netdev, XDP_FLAGS_SKB_MODE);
+
+    return 0;
 }
 #endif
